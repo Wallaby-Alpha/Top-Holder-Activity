@@ -415,13 +415,17 @@ def get_top_holders(rpc_url, mint, top_n, all_lp):
 def get_holder_activity(rpc_url, token_acct, owner, mint, lookback_days,
                          sig_limit, all_lp, batch_size=25):
     """
-    Walk the token account's recent signatures (within lookback window),
-    fetch transactions, extract balance changes, return aggregated stats.
+    Walk the OWNER WALLET address for recent signatures (not the token account).
+    Token account addresses rarely appear as signers — the wallet is always the
+    fee payer/signer, so getSignaturesForAddress on the wallet gives us every
+    swap/transfer this wallet has participated in, which we then filter for
+    balance changes on this specific mint.
     """
     cutoff_ts = int((dt.datetime.now(dt.timezone.utc)
                      - dt.timedelta(days=lookback_days)).timestamp())
 
-    sigs = get_all_signatures(rpc_url, token_acct, sig_limit, after_ts=cutoff_ts)
+    # Walk the wallet address, not the token account
+    sigs = get_all_signatures(rpc_url, owner, sig_limit, after_ts=cutoff_ts)
     if not sigs:
         return {"buys_7d": 0.0, "sells_7d": 0.0, "net_7d": 0.0, "tx_count_7d": 0}
 
@@ -438,6 +442,8 @@ def get_holder_activity(rpc_url, token_acct, owner, mint, lookback_days,
             continue
         for tx in results:
             changes = extract_balance_changes(tx, mint, all_lp)
+            # Only count a transaction once even if it has multiple change records
+            tx_had_activity = False
             for (chg_owner, delta, ts, is_lp) in changes:
                 if is_lp or chg_owner != owner:
                     continue
@@ -445,6 +451,8 @@ def get_holder_activity(rpc_url, token_acct, owner, mint, lookback_days,
                     buys += delta
                 else:
                     sells += abs(delta)
+                tx_had_activity = True
+            if tx_had_activity:
                 tx_count += 1
         time.sleep(0.03)
 
