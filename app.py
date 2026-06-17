@@ -346,27 +346,28 @@ def overlap_matrix(wallet_df, cohorts):
 # ---------------------------------------------------------------------------
 # Top holders helpers
 # ---------------------------------------------------------------------------
-def get_top_holders(rpc_url, mint, top_n, all_lp):
+SPL_TOKEN_PROGRAM    = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM   = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+def _query_holders_for_program(rpc_url, program_id, mint, all_lp, datasize=None):
     """
-    Use getProgramAccounts on the SPL Token program filtered by mint to get
-    all token accounts, sorted by balance, top N returned (LP accounts removed).
+    Call getProgramAccounts for `program_id` filtered by mint.
+    `datasize` is optional — Token-2022 accounts vary in size (extensions),
+    so we omit the dataSize filter for that program and rely solely on the
+    memcmp filter at offset 0 (mint address).
     """
-    params = [
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        {
-            "encoding": "jsonParsed",
-            "filters": [
-                {"dataSize": 165},
-                {"memcmp": {"offset": 0, "bytes": mint}},
-            ],
-        },
-    ]
-    result = rpc_call(rpc_url, "getProgramAccounts", params)
-    if not result:
+    filters = [{"memcmp": {"offset": 0, "bytes": mint}}]
+    if datasize:
+        filters.insert(0, {"dataSize": datasize})
+
+    params = [program_id, {"encoding": "jsonParsed", "filters": filters}]
+    try:
+        result = rpc_call(rpc_url, "getProgramAccounts", params)
+    except RuntimeError:
         return []
 
     holders = []
-    for acct in result:
+    for acct in (result or []):
         info = (acct.get("account", {})
                     .get("data", {})
                     .get("parsed", {})
@@ -378,10 +379,37 @@ def get_top_holders(rpc_url, mint, top_n, all_lp):
         amt = float((info.get("tokenAmount") or {}).get("uiAmount") or 0)
         if amt <= 0:
             continue
-        holders.append({"wallet": owner, "token_account": token_acct, "current_balance": amt})
+        holders.append({
+            "wallet": owner,
+            "token_account": token_acct,
+            "current_balance": amt,
+            "token_program": program_id,
+        })
+    return holders
+
+
+def get_top_holders(rpc_url, mint, top_n, all_lp):
+    """
+    Try standard SPL Token program first (account size = 165 bytes).
+    If that returns nothing, fall back to Token-2022 program (variable
+    account size — no dataSize filter applied).
+    Returns (holders_list, program_label).
+    """
+    # Standard SPL
+    holders = _query_holders_for_program(
+        rpc_url, SPL_TOKEN_PROGRAM, mint, all_lp, datasize=165
+    )
+    program_label = "SPL Token (standard)"
+
+    if not holders:
+        # Token-2022 fallback — no fixed dataSize
+        holders = _query_holders_for_program(
+            rpc_url, TOKEN_2022_PROGRAM, mint, all_lp, datasize=None
+        )
+        program_label = "Token-2022"
 
     holders.sort(key=lambda x: x["current_balance"], reverse=True)
-    return holders[:top_n]
+    return holders[:top_n], program_label
 
 
 def get_holder_activity(rpc_url, token_acct, owner, mint, lookback_days,
@@ -611,21 +639,24 @@ with tab2:
     run_holders = st.button("🚀 Run Top Holders Scan", type="primary", key="run_holders")
 
     if run_holders:
-        # Step 1: get holders
+        # Step 1: get holders (tries SPL Token first, falls back to Token-2022)
         with st.spinner(f"Fetching top {top_n} holders via getProgramAccounts..."):
             try:
-                holders = get_top_holders(rpc_url, token_address, top_n, ALL_LP)
+                holders, program_label = get_top_holders(rpc_url, token_address, top_n, ALL_LP)
             except RuntimeError as e:
                 st.error(str(e)); st.stop()
 
         if not holders:
-            st.warning(
-                "No holders found. This can happen if the token uses Token-2022 "
-                "(different program ID). Token-2022 support coming soon."
+            st.error(
+                "No holders found under either SPL Token or Token-2022 programs. "
+                "Double-check the mint address, or the token may use a custom/unlisted program."
             )
             st.stop()
 
-        st.success(f"Found {len(holders)} non-LP holders with a positive balance.")
+        st.success(
+            f"Found {len(holders)} non-LP holders with a positive balance "
+            f"(token program: **{program_label}**)."
+        )
 
         # Step 2: scan activity for each holder
         st.subheader("Scanning holder activity...")
