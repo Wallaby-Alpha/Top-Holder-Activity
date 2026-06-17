@@ -635,127 +635,246 @@ with tab1:
 
 
 # ===========================================================================
-# TAB 2 - Top Holders Activity
+# TAB 2 - Top Holders Activity (Solscan CSV upload)
 # ===========================================================================
 with tab2:
     st.header("Top Holders Activity")
-    st.caption(
-        f"Pulls current top holders by token balance (LP accounts auto-filtered), "
-        f"then checks each wallet's token account for buys/sells over the last "
-        f"{holder_lookback_days} days."
+
+    st.info(
+        "**How to get the CSV from Solscan:**\n"
+        "1. Go to `https://solscan.io/token/<mint_address>#transfers`\n"
+        "2. Click **Export** (top-right of the transfers table) → download the CSV\n"
+        "3. Upload it below. The CSV contains every transfer with sender, receiver, "
+        "amount, and timestamp — far more reliable than RPC for high-volume tokens."
     )
-    run_holders = st.button("🚀 Run Top Holders Scan", type="primary", key="run_holders")
 
-    if run_holders:
-        # Step 1: get holders (tries SPL Token first, falls back to Token-2022)
-        with st.spinner(f"Fetching top {top_n} holders via getProgramAccounts..."):
-            try:
-                holders, program_label = get_top_holders(rpc_url, token_address, top_n, ALL_LP)
-            except RuntimeError as e:
-                st.error(str(e)); st.stop()
+    uploaded_csv = st.file_uploader(
+        "Upload Solscan token transfers CSV", type=["csv"], key="solscan_csv"
+    )
 
-        if not holders:
+    # Optional: also pull current holder balances from RPC to enrich the output
+    fetch_balances = st.checkbox(
+        "Also fetch current holder balances from RPC (slower but adds Current Balance column)",
+        value=True,
+    )
+
+    run_holders = st.button("🚀 Analyse", type="primary", key="run_holders")
+
+    if run_holders and uploaded_csv:
+
+        # ------------------------------------------------------------------
+        # Step 1: parse the Solscan CSV
+        # Solscan transfer exports typically have these columns (may vary):
+        #   Signature, Block, Time, From, To, Amount, Token, Decimals
+        # Some exports use "Source" / "Destination" or "Sender" / "Receiver"
+        # We normalise whatever we find.
+        # ------------------------------------------------------------------
+        raw = pd.read_csv(uploaded_csv)
+        st.caption(f"Raw CSV columns: `{list(raw.columns)}`")
+
+        # Normalise column names — lowercase + strip spaces
+        raw.columns = [c.strip().lower().replace(" ", "_") for c in raw.columns]
+
+        # Detect wallet columns
+        col_map = {}
+        for candidate in ["from", "source", "sender", "from_address"]:
+            if candidate in raw.columns:
+                col_map["from"] = candidate
+                break
+        for candidate in ["to", "destination", "receiver", "to_address"]:
+            if candidate in raw.columns:
+                col_map["to"] = candidate
+                break
+        for candidate in ["amount", "token_amount", "quantity", "value"]:
+            if candidate in raw.columns:
+                col_map["amount"] = candidate
+                break
+        for candidate in ["time", "block_time", "timestamp", "date", "datetime"]:
+            if candidate in raw.columns:
+                col_map["time"] = candidate
+                break
+
+        missing = [k for k in ["from", "to", "amount"] if k not in col_map]
+        if missing:
             st.error(
-                "No holders found under either SPL Token or Token-2022 programs. "
-                "Double-check the mint address, or the token may use a custom/unlisted program."
+                f"Could not find columns for: {missing}. "
+                f"Columns in your CSV: `{list(raw.columns)}`. "
+                "Please check the export format and try again."
             )
             st.stop()
 
-        st.success(
-            f"Found {len(holders)} non-LP holders with a positive balance "
-            f"(token program: **{program_label}**)."
+        # Build a clean transfers dataframe
+        transfers = pd.DataFrame()
+        transfers["from"]   = raw[col_map["from"]].astype(str).str.strip()
+        transfers["to"]     = raw[col_map["to"]].astype(str).str.strip()
+        transfers["amount"] = pd.to_numeric(raw[col_map["amount"]], errors="coerce").fillna(0)
+
+        if col_map.get("time"):
+            transfers["time"] = pd.to_datetime(raw[col_map["time"]], utc=True, errors="coerce")
+        else:
+            transfers["time"] = pd.NaT
+
+        # Apply LP filter: drop rows where from OR to is a known LP address
+        lp_mask = transfers["from"].isin(ALL_LP) | transfers["to"].isin(ALL_LP)
+        lp_removed = lp_mask.sum()
+        transfers = transfers[~lp_mask].copy()
+
+        st.markdown(
+            f"- **Total transfer rows in CSV:** {len(raw)}\n"
+            f"- **LP / pool rows filtered out:** {lp_removed}\n"
+            f"- **Clean transfer rows remaining:** {len(transfers)}"
         )
 
-        # Step 2: scan activity for each holder
-        st.subheader("Scanning holder activity...")
-        holder_prog = st.progress(0)
-        holder_status = st.empty()
-        results = []
+        if transfers.empty:
+            st.warning("No transfers remain after LP filtering.")
+            st.stop()
 
-        for idx, h in enumerate(holders):
-            holder_status.text(f"Scanning wallet {idx+1}/{len(holders)}: {h['wallet'][:12]}...")
-            try:
-                activity = get_holder_activity(
-                    rpc_url,
-                    token_acct=h["token_account"],
-                    owner=h["wallet"],
-                    mint=token_address,
-                    lookback_days=holder_lookback_days,
-                    sig_limit=holder_sig_limit,
-                    all_lp=ALL_LP,
-                )
-            except Exception:
-                activity = {"buys_7d": 0.0, "sells_7d": 0.0, "net_7d": 0.0, "tx_count_7d": 0}
-            results.append({**h, **activity})
-            holder_prog.progress((idx + 1) / len(holders))
-            time.sleep(0.05)
+        # ------------------------------------------------------------------
+        # Step 2: apply lookback window
+        # ------------------------------------------------------------------
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=holder_lookback_days)
+        if transfers["time"].notna().any():
+            recent = transfers[transfers["time"] >= cutoff].copy()
+            st.caption(
+                f"Transfers within last {holder_lookback_days} days: {len(recent)} "
+                f"(from {cutoff.strftime('%Y-%m-%d %H:%M UTC')} to now)"
+            )
+        else:
+            recent = transfers.copy()
+            st.warning("No timestamp column found — using all rows for activity (no time filter applied).")
 
-        holder_prog.empty()
-        holder_status.empty()
+        # ------------------------------------------------------------------
+        # Step 3: aggregate buys and sells per wallet
+        # A wallet "buys" when it appears in the TO column (receives tokens).
+        # A wallet "sells" when it appears in the FROM column (sends tokens).
+        # ------------------------------------------------------------------
+        buys = (
+            recent.groupby("to")["amount"].sum()
+            .rename("buys")
+            .reset_index()
+            .rename(columns={"to": "wallet"})
+        )
+        sells = (
+            recent.groupby("from")["amount"].sum()
+            .rename("sells")
+            .reset_index()
+            .rename(columns={"from": "wallet"})
+        )
+        tx_counts = (
+            recent.assign(wallet=recent["to"])
+            .groupby("wallet")["amount"].count()
+            .add(
+                recent.assign(wallet=recent["from"])
+                .groupby("wallet")["amount"].count(),
+                fill_value=0,
+            )
+            .rename("tx_count")
+            .reset_index()
+        )
 
-        # Step 3: build display table
-        df = pd.DataFrame(results)
-        df["rank"] = range(1, len(df) + 1)
-        df["activity"] = df.apply(classify_activity, axis=1)
-        df["buy_sell_ratio"] = df.apply(
-            lambda r: round(r["buys_7d"] / r["sells_7d"], 2) if r["sells_7d"] > 1e-9 else float("inf"),
+        activity_df = (
+            buys.merge(sells, on="wallet", how="outer")
+            .merge(tx_counts, on="wallet", how="outer")
+            .fillna(0)
+        )
+        activity_df["net"] = activity_df["buys"] - activity_df["sells"]
+
+        # ------------------------------------------------------------------
+        # Step 4: compute all-time balance per wallet from full CSV
+        # (not just the lookback window) for a "current balance" estimate
+        # ------------------------------------------------------------------
+        all_buys  = transfers.groupby("to")["amount"].sum().rename("all_buys").reset_index().rename(columns={"to": "wallet"})
+        all_sells = transfers.groupby("from")["amount"].sum().rename("all_sells").reset_index().rename(columns={"from": "wallet"})
+        balance_df = all_buys.merge(all_sells, on="wallet", how="outer").fillna(0)
+        balance_df["csv_balance"] = balance_df["all_buys"] - balance_df["all_sells"]
+
+        activity_df = activity_df.merge(balance_df[["wallet", "csv_balance"]], on="wallet", how="left").fillna(0)
+
+        # ------------------------------------------------------------------
+        # Step 5: optionally enrich with live RPC balances
+        # ------------------------------------------------------------------
+        if fetch_balances and api_key and token_address:
+            with st.spinner("Fetching current holder balances from RPC..."):
+                try:
+                    holders, program_label = get_top_holders(rpc_url, token_address, 2000, ALL_LP)
+                    rpc_balance_map = {h["wallet"]: h["current_balance"] for h in holders}
+                    activity_df["current_balance"] = activity_df["wallet"].map(rpc_balance_map).fillna(activity_df["csv_balance"])
+                    st.caption(f"RPC balances fetched via {program_label} for {len(holders)} holders.")
+                except Exception as e:
+                    st.warning(f"RPC balance fetch failed ({e}) — using CSV-derived balances.")
+                    activity_df["current_balance"] = activity_df["csv_balance"]
+        else:
+            activity_df["current_balance"] = activity_df["csv_balance"]
+
+        # ------------------------------------------------------------------
+        # Step 6: filter to top N by current balance, classify activity
+        # ------------------------------------------------------------------
+        # Remove dust wallets (zero or negative balance from the CSV)
+        activity_df = activity_df[activity_df["current_balance"] > 1e-9].copy()
+
+        # Remove LP addresses that slipped through (belt-and-suspenders)
+        activity_df = activity_df[~activity_df["wallet"].isin(ALL_LP)]
+
+        activity_df = activity_df.sort_values("current_balance", ascending=False).head(top_n).copy()
+        activity_df["rank"] = range(1, len(activity_df) + 1)
+
+        # Classify using the same logic, adapted for column names
+        def classify_row(row):
+            net   = row["net"]
+            buys  = row["buys"]
+            sells = row["sells"]
+            total = buys + sells
+            if total < 1e-9:
+                return "⚪ No Activity"
+            buy_pct = buys / total
+            if net > 0 and buy_pct >= 0.6:
+                return "🟢 Accumulating"
+            elif net < 0 and buy_pct <= 0.4:
+                return "🔴 Distributing"
+            elif abs(net) / (row["current_balance"] + 1e-9) < 0.05:
+                return "🟡 Holding"
+            elif net > 0:
+                return "🟢 Net Buying"
+            else:
+                return "🔴 Net Selling"
+
+        activity_df["activity"]       = activity_df.apply(classify_row, axis=1)
+        activity_df["buy_sell_ratio"] = activity_df.apply(
+            lambda r: round(r["buys"] / r["sells"], 2) if r["sells"] > 1e-9 else float("inf"),
             axis=1,
         )
 
-        display_cols = [
-            "rank", "wallet", "current_balance",
-            "buys_7d", "sells_7d", "net_7d", "buy_sell_ratio",
-            "tx_count_7d", "activity",
-        ]
-        df_display = df[display_cols].copy()
-        df_display.columns = [
-            "Rank", "Wallet", "Current Balance",
-            f"Buys ({holder_lookback_days}d)", f"Sells ({holder_lookback_days}d)",
-            f"Net ({holder_lookback_days}d)", "Buy/Sell Ratio",
-            "TX Count", "Activity",
-        ]
-
-        # Summary bar
+        # ------------------------------------------------------------------
+        # Step 7: display
+        # ------------------------------------------------------------------
         col1, col2, col3, col4 = st.columns(4)
-        accum = (df["activity"].str.contains("Accumulating|Net Buying")).sum()
-        distrib = (df["activity"].str.contains("Distributing|Net Selling")).sum()
-        holding = (df["activity"].str.contains("Holding")).sum()
-        inactive = (df["activity"].str.contains("No Activity")).sum()
-        col1.metric("🟢 Accumulating", accum)
-        col2.metric("🔴 Distributing", distrib)
-        col3.metric("🟡 Holding", holding)
-        col4.metric("⚪ No Activity", inactive)
+        col1.metric("🟢 Accumulating", (activity_df["activity"].str.contains("Accumulating|Net Buying")).sum())
+        col2.metric("🔴 Distributing", (activity_df["activity"].str.contains("Distributing|Net Selling")).sum())
+        col3.metric("🟡 Holding",      (activity_df["activity"].str.contains("Holding")).sum())
+        col4.metric("⚪ No Activity",  (activity_df["activity"].str.contains("No Activity")).sum())
 
-        st.subheader(f"Top {len(df)} Holders — {holder_lookback_days}d Activity")
+        display_cols   = ["rank", "wallet", "current_balance", "buys", "sells", "net", "buy_sell_ratio", "tx_count", "activity"]
+        display_labels = ["Rank", "Wallet", "Current Balance",
+                          f"Buys ({holder_lookback_days}d)", f"Sells ({holder_lookback_days}d)",
+                          f"Net ({holder_lookback_days}d)", "Buy/Sell Ratio", "TX Count", "Activity"]
+
+        df_display = activity_df[display_cols].copy()
+        df_display.columns = display_labels
+
+        st.subheader(f"Top {len(activity_df)} Holders — {holder_lookback_days}d Activity")
         st.dataframe(df_display, use_container_width=True)
+        st.download_button("⬇️ Download CSV", df_display.to_csv(index=False).encode(),
+            file_name="top_holders_activity.csv", mime="text/csv")
 
-        csv = df_display.to_csv(index=False).encode()
-        st.download_button(
-            "⬇️ Download Top Holders CSV", csv,
-            file_name="top_holders_activity.csv", mime="text/csv",
-        )
-
-        # Spotlight: strong accumulators
-        accum_df = df[df["activity"].str.contains("Accumulating|Net Buying")].sort_values(
-            "net_7d", ascending=False
-        )
+        accum_df = activity_df[activity_df["activity"].str.contains("Accumulating|Net Buying")].sort_values("net", ascending=False)
         if not accum_df.empty:
             st.subheader("🟢 Strong Accumulators")
-            st.dataframe(accum_df[display_cols], use_container_width=True)
+            st.dataframe(accum_df[display_cols].rename(columns=dict(zip(display_cols, display_labels))), use_container_width=True)
 
-        # Spotlight: strong sellers
-        distrib_df = df[df["activity"].str.contains("Distributing|Net Selling")].sort_values(
-            "net_7d"
-        )
-        if not distrib_df.empty:
+        dist_df = activity_df[activity_df["activity"].str.contains("Distributing|Net Selling")].sort_values("net")
+        if not dist_df.empty:
             st.subheader("🔴 Active Sellers")
-            st.dataframe(distrib_df[display_cols], use_container_width=True)
+            st.dataframe(dist_df[display_cols].rename(columns=dict(zip(display_cols, display_labels))), use_container_width=True)
 
-    else:
-        st.info(
-            f"Click **Run Top Holders Scan** to pull the top {top_n} holders "
-            f"and check their {holder_lookback_days}-day buy/sell activity.\n\n"
-            "**LP filtering:** Raydium, Orca, Meteora, pump.fun AMM pool accounts "
-            "are automatically excluded from the holder list and from buy/sell counts. "
-            "Add custom LP addresses in the sidebar if needed."
-        )
+    elif run_holders and not uploaded_csv:
+        st.warning("Please upload a Solscan CSV first.")
